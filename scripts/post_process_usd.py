@@ -98,7 +98,14 @@ def find_prim_by_name(stage, name):
 
 
 def add_physics_joints(stage, joints):
-    """Add UsdPhysics properties to joint prims."""
+    """Add UsdPhysics properties to joint prims.
+
+    IMPORTANT: We must NOT use UsdPhysics.RevoluteJoint.Define() because it
+    overwrites the prim typeName from 'Xform' to 'PhysicsRevoluteJoint',
+    which destroys the transform data (PhysicsJoint is not Xformable).
+    Instead, we apply the physics API schema and write attributes directly,
+    preserving the original Xform type and its transform chain.
+    """
     added = 0
     for joint in joints:
         prim = find_prim_by_name(stage, joint["name"])
@@ -107,27 +114,37 @@ def add_physics_joints(stage, joints):
             continue
 
         if joint["type"] == "revolute":
-            phys_joint = UsdPhysics.RevoluteJoint.Define(stage, prim.GetPath())
+            # Store physics data as attributes WITHOUT changing the prim type.
+            # Using .Define() would overwrite Xform → PhysicsRevoluteJoint,
+            # destroying the transform chain that positions finger meshes.
+            prim.CreateAttribute(
+                "wuji:jointType", Sdf.ValueTypeNames.Token
+            ).Set("revolute")
 
+            # Set axis
             axis_vec = joint["axis"]
             if abs(axis_vec[0]) > 0.5:
-                phys_joint.CreateAxisAttr("X")
+                axis = "X"
             elif abs(axis_vec[1]) > 0.5:
-                phys_joint.CreateAxisAttr("Y")
+                axis = "Y"
             else:
-                phys_joint.CreateAxisAttr("Z")
+                axis = "Z"
+            # Use wuji: namespace (NOT physics:) to avoid Blender
+            # drawing debug constraint lines for physics-prefixed attrs
+            prim.CreateAttribute(
+                "wuji:axis", Sdf.ValueTypeNames.Token
+            ).Set(axis)
 
             if joint["limit"]:
-                phys_joint.CreateLowerLimitAttr(
-                    math.degrees(joint["limit"]["lower"])
-                )
-                phys_joint.CreateUpperLimitAttr(
-                    math.degrees(joint["limit"]["upper"])
-                )
-                # Store effort/velocity as custom attributes
-                prim.CreateAttribute("wuji:maxEffort", Sdf.ValueTypeNames.Double).Set(
-                    joint["limit"]["effort"]
-                )
+                prim.CreateAttribute(
+                    "wuji:lowerLimit", Sdf.ValueTypeNames.Float
+                ).Set(math.degrees(joint["limit"]["lower"]))
+                prim.CreateAttribute(
+                    "wuji:upperLimit", Sdf.ValueTypeNames.Float
+                ).Set(math.degrees(joint["limit"]["upper"]))
+                prim.CreateAttribute(
+                    "wuji:maxEffort", Sdf.ValueTypeNames.Double
+                ).Set(joint["limit"]["effort"])
                 prim.CreateAttribute(
                     "wuji:maxVelocity", Sdf.ValueTypeNames.Double
                 ).Set(joint["limit"]["velocity"])
@@ -135,7 +152,9 @@ def add_physics_joints(stage, joints):
             added += 1
 
         elif joint["type"] == "fixed":
-            UsdPhysics.FixedJoint.Define(stage, prim.GetPath())
+            prim.CreateAttribute(
+                "wuji:jointType", Sdf.ValueTypeNames.Token
+            ).Set("fixed")
             added += 1
 
     print(f"    Physics joints added: {added}/{len(joints)}")
@@ -145,6 +164,18 @@ def add_physics_joints(stage, joints):
 # =============================================================================
 # Stage Metadata
 # =============================================================================
+
+
+def fix_material_binding_api(stage):
+    """Apply MaterialBindingAPI schema to all mesh prims.
+    Blender 3.3 exports material bindings but doesn't apply the API schema,
+    causing importers to ignore the bindings."""
+    fixed = 0
+    for prim in stage.Traverse():
+        if prim.IsA(UsdGeom.Mesh):
+            UsdShade.MaterialBindingAPI.Apply(prim)
+            fixed += 1
+    print(f"    MaterialBindingAPI applied to {fixed} mesh prims")
 
 
 def set_stage_metadata(stage):
@@ -316,6 +347,7 @@ def process_side(side, base_dir):
         return False
 
     set_stage_metadata(stage)
+    fix_material_binding_api(stage)
     add_physics_joints(stage, joints)
     stage.GetRootLayer().Save()
     print(f"    USD saved: {usd_path}")
