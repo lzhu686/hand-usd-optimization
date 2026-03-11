@@ -256,8 +256,21 @@ def package_deliverable(usd_path, exports_dir, side):
     package_dir.mkdir(parents=True, exist_ok=True)
 
     # Copy main USD file
+    # Use os.system('copy') on Windows because pxr memory-maps USDC files
+    # and shutil.copy2 fails with WinError 1224 (user-mapped section open)
     dest_usd = package_dir / usd_path.name
-    shutil.copy2(usd_path, dest_usd)
+    if sys.platform == "win32":
+        src_win = str(usd_path).replace("/", "\\")
+        dst_win = str(dest_usd).replace("/", "\\")
+        ret = os.system(f'copy /Y "{src_win}" "{dst_win}" >NUL 2>&1')
+        if ret != 0:
+            # Fallback: read bytes manually
+            with open(str(usd_path), "rb") as f:
+                data = f.read()
+            with open(str(dest_usd), "wb") as f:
+                f.write(data)
+    else:
+        shutil.copy2(usd_path, dest_usd)
 
     # Copy textures directory if it exists next to the USD
     textures_src = usd_path.parent / "textures"
@@ -355,6 +368,19 @@ def process_side(side, base_dir):
     # Verify
     print("\n  [3/4] Verifying USD structure...")
     verify_usd(stage, links)
+
+    # Release file handle before copying (Windows file locking)
+    layer = stage.GetRootLayer()
+    layer_id = layer.identifier
+    del stage
+    del layer
+    # Force pxr to release the file handle on Windows
+    Sdf.Layer.Find(layer_id)  # ensure it's findable
+    found = Sdf.Layer.Find(layer_id)
+    if found:
+        found.Clear()
+    import gc
+    gc.collect()
 
     # Package
     print("  [4/4] Packaging deliverable...")
