@@ -1,123 +1,104 @@
 # Wuji Hand USD Optimization
 
-让 Wuji 灵巧手的 USD 模型与真实物理手匹配的专项优化工程。
+让 Wuji 灵巧手 USD 模型视觉匹配真机：黑色手套 + 红色 Logo。
 
-## Background
-
-当前 Wuji Hand 的 3D 模型从 Fusion 360 → SolidWorks → STEP/STL 导出，仅包含几何数据，没有纹理和材质信息。URDF/MJCF 文件中所有零件使用统一的灰色 `rgba(0.898, 0.918, 0.929, 1)`。
-
-**目标**：生成视觉上接近真机的 USD 格式模型。
-
-## Target Visual Spec
-
-| Element | Appearance |
-|---------|------------|
-| 手掌/手指主体 | 纯黑 (模拟手套质感) |
-| 手背 Logo | 红色 Wuji/舞肌 标识 |
-| 材质质感 | 哑光橡胶/织物 (roughness ~0.7) |
-
-## Project Structure
+## 目录结构
 
 ```
 hand-usd-optimization/
-├── README.md                  # 本文件
-├── docs/
-│   └── knowledge-base.md      # 详细技术知识库
-├── textures/
-│   ├── logo/                  # Wuji logo 素材 (PNG/SVG)
-│   └── base/                  # 基础纹理 (黑色材质贴图)
-├── scripts/                   # 转换/处理脚本
-├── usd/
-│   ├── right/                 # 右手 USD 输出
-│   └── left/                  # 左手 USD 输出
-├── references/                # 参考图片/真机照片
-└── exports/                   # 最终导出文件
+├── README.md                          # 本文件
+│
+├── fused/                             # ★ 产品级 USD (Isaac Sim 就绪)
+│   ├── right/
+│   │   ├── wujihand_right_filtered.usd          # 右手入口 (sublayer 引用)
+│   │   └── configuration/
+│   │       ├── wujihand_right_filtered_base.usd     # 几何 + 材质 (BlackGlove + PalmWithLogo)
+│   │       ├── wujihand_right_filtered_physics.usd  # 物理碰撞
+│   │       ├── wujihand_right_filtered_robot.usd    # 关节/驱动
+│   │       └── wujihand_right_filtered_sensor.usd   # 传感器
+│   └── left/
+│       ├── wujihand_left_filtered.usd           # 左手入口
+│       └── configuration/
+│           ├── wujihand_left_filtered_base.usd
+│           ├── wujihand_left_filtered_physics.usd
+│           ├── wujihand_left_filtered_robot.usd
+│           └── wujihand_left_filtered_sensor.usd
+│
+├── baseline/                          # 源素材 (来自 wuji-hand-description v0.2.2)
+│   ├── VERSION.md                     # 版本溯源
+│   ├── stl/{left,right}/             # 52 个 STL 网格 (26/手)
+│   ├── urdf/                          # left.urdf + right.urdf
+│   └── step/right/                    # 右手掌 STEP + STL 源文件
+│
+├── textures/logo/                     # 品牌素材
+│   ├── wuji_logo_official.png         # 官方 Logo (小尺寸)
+│   ├── wuji_logo_official_hires.png   # 官方 Logo (高清)
+│   └── wuji_logo_placeholder.png      # 开发用占位纹理
+│
+├── references/                        # 参考数据
+│   └── left_palm_uv_data.json        # 左手掌 UV 坐标 (28188 coords, Blender 导出)
+│
+├── scripts/                           # 构建工具
+│   ├── README.md                      # 脚本使用文档
+│   ├── fuse_rl_appearance.py          # ★ 核心: RL USD + 外观材质融合
+│   ├── blender_build_hand.py          # Blender 自动构建 (STL→材质→USD)
+│   ├── generate_logo_texture.py       # Logo 纹理生成 (PIL)
+│   ├── post_process_usd.py            # USD 后处理
+│   ├── urdf_to_usd.py                 # URDF→USD 转换 (pxr)
+│   ├── verify_usd_in_blender.py       # Blender 验证脚本
+│   └── build_all.bat                  # 一键构建
+│
+└── docs/                              # 文档
+    ├── tech-spec-wh110-logo.md        # 当前技术规格 (v2.3)
+    └── archive/                       # 历史文档
 ```
 
-## Source Assets
+## 关键资产对照
 
-所有素材均可追溯至两个上游来源，确保版本一致。
+### 1. 客户 RL USD (原版，无 Logo)
 
-### 1. 机械组提供 (CAD 原始文件)
-
-由机械工程师从 SolidWorks 导出，包含完整参数化几何信息。
-
-| File | Path | Format | Description |
-|------|------|--------|-------------|
-| 右手手掌.STEP | `C:\Users\zhuliang\Desktop\wuji\右手手掌.STEP` | STEP AP214 | 右手手掌 CAD 源文件，含完整 B-Rep 几何 |
-| 右手手掌.STL | `C:\Users\zhuliang\Desktop\wuji\右手手掌.STL` | Binary STL | 右手手掌网格，SolidWorks 导出的 tessellated 版本 |
-
-> **Pipeline**: Fusion 360 → SolidWorks → STEP + STL 导出
-
-### 2. GitHub 仓库 (运动学 + 全零件网格)
-
-| Source | Repo | Version | Local Path |
-|--------|------|---------|------------|
-| URDF/MJCF | [wuji-hand-description](https://github.com/wuji-technology/wuji-hand-description) | v0.2.2 (`88ee51d`) | `../wuji-hand-description/` |
-| STL Meshes (52pcs) | 同上 `meshes/{left,right}/` | v0.2.2 | 同上 |
-| Isaac Sim Demo | [isaaclab-sim](https://github.com/wuji-technology/isaaclab-sim) | main | `../isaaclab-sim/` |
-
-### 3. Baseline 汇总仓库 (版本锁定, git 管理)
-
-以上所有格式统一整理至 `../wuji-hand-baseline/`，含 STEP/STL/URDF/USD 四种格式，
-均来自 wuji-hand-description **v0.2.2**，详见其 [VERSION.md](../wuji-hand-baseline/VERSION.md)。
-
-### 格式关系图
+位置: `../wujihand_usd_rl/`
 
 ```
-机械组 (SolidWorks)                 GitHub (wuji-hand-description v0.2.2)
-  │                                     │
-  ├── 右手手掌.STEP (CAD 源)            ├── urdf/{left,right}.urdf
-  └── 右手手掌.STL  (网格)             ├── meshes/ → 52x STL
-                                        └── mjcf/{left,right}.xml
-      │                                     │
-      └───────── 汇总 ──────────────────────┘
-                  │
-         wuji-hand-baseline/ (git)
-         ├── step/  ← 机械组 STEP
-         ├── stl/   ← GitHub STL
-         ├── urdf/  ← GitHub URDF
-         └── usd/   ← urdf_to_usd.py 生成 (pxr usd-core)
+wujihand_usd_rl/
+├── wujihand_right_filtered.usd        # 右手入口
+├── wujihand_left_filtered.usd         # 左手入口
+└── configuration/                     # 4层 sublayer × 2手 = 8文件
+    ├── *_base.usd                     # 几何 (灰色默认材质)
+    ├── *_physics.usd                  # 碰撞
+    ├── *_robot.usd                    # 关节
+    └── *_sensor.usd                   # 传感器
 ```
 
-## Implementation Roadmap
+**状态**: Isaac Sim 可用，客户在用。外观为灰色默认材质。
 
-### Phase 1: Basic Coloring (Quick Win)
-- [ ] URDF → USD 转换 (Isaac Sim or Blender)
-- [ ] 全零件应用黑色 PBR 材质
-- [ ] 手掌部分应用红色 Logo 区域
-- [ ] 验证 asset 引用路径正确性
+### 2. Fused USD (加材质版)
 
-### Phase 2: Enhanced Materials
-- [ ] 添加 roughness/metallic maps 模拟手套质感
-- [ ] Logo 贴图制作 (PNG texture)
-- [ ] UV unwrap 手掌区域用于 Logo 放置
+位置: `fused/`
 
-### Phase 3: High Fidelity (Optional)
-- [ ] 3D 扫描真机获取基础素材
-- [ ] Blender/UE 布料系统模拟手套
-- [ ] 完整 PBR 材质 pipeline
-- [ ] 协同 ID 设计师完善
+**状态**: 基于 RL USD 的 base 层注入了 OmniPBR 材质 (BlackGlove + PalmWithLogo)，
+physics/robot/sensor 层保持不变。待 Isaac Sim 最终验证 + Logo 纹理。
 
-## Quick Start
+### 3. 差异说明
 
-```bash
-# 1. 确保 wuji-hand-description 已 clone
-cd C:\Users\zhuliang\Desktop\wuji
-git clone https://github.com/wuji-technology/wuji-hand-description.git
+| 对比项 | 客户 RL USD | Fused USD |
+|--------|------------|-----------|
+| 位置 | `wujihand_usd_rl/` | `fused/` |
+| 材质 | 灰色 DefaultMaterial | BlackGlove (黑) + PalmWithLogo (红 Logo) |
+| Logo | 无 | 占位纹理 (待正式素材) |
+| 物理/关节 | 完整 | 同 RL (直接复制) |
+| Isaac Sim | 已验证 | 待验证 |
 
-# 2. 安装依赖 (选择一种)
-# Option A: NVIDIA Isaac Sim (推荐)
-# Option B: Blender 3.6+ with USD plugin
-# Option C: pip install usd-core
+## 视觉规格
 
-# 3. 执行转换 (待实现)
-# python scripts/urdf_to_usd.py
-```
+| 部件 | 外观 |
+|------|------|
+| 手掌/手指主体 | 纯黑哑光 (roughness 0.7, metallic 0) |
+| 手背 Logo | 红色 Wuji/舞肌 标识 (OmniPBR 纹理) |
 
-## Notes
+## 技术要点
 
-- 纹理问题大概率是 asset 引用路径问题 — USD 中需注意 `@path@` 语法
-- 如果当前没有纹理基础，最快的方式是做三维扫描或找 ID 设计师
-- Blender / UE 的布料系统可以做出更好的手套可视化效果
-- 现阶段建议从简单上色开始，逐步迭代
+- **材质系统**: OmniPBR (Isaac Sim/Omniverse 原生)
+- **UV**: 手掌 palm_link 已有 UV unwrap 数据; 其他零件无 UV (纯色不需要)
+- **Blender 验证注意**: 导入 USD 时必须勾选 "Import USD Preview" (实验性功能)
+- **Python 依赖**: usd-core 需要 Python 3.12 (`C:\Python312\python.exe`)
