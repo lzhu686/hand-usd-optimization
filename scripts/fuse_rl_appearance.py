@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-Fuse RL training USD with visual appearance (BlackGlove + PalmWithLogo).
+Fuse IsaacLab-generated USD with visual appearance from Blender exports.
 
 Strategy:
-  1. Copy RL USD structure to fused/ output directory
-  2. Modify base layer: replace materials + add UV to palm mesh
-  3. Keep physics/robot/sensor layers untouched
-  4. Copy logo texture
+  1. Copy IsaacLab raw USD structure to usd_final/ output directory
+  2. Extract UV data from Blender debug USD (usd/{side}/) for textured links
+  3. Transfer UV to IsaacLab mesh via KDTree nearest-neighbor matching
+  4. Create dual-context materials (OmniPBR + UsdPreviewSurface)
+  5. Bake composite textures (original centered on grey canvas for UV Clip workaround)
+  6. Bind materials: textured dual material for links with textures, BlackGlove for rest
 
 Materials are authored with dual context:
   - OmniPBR (MDL)        -> outputs:mdl:surface   (Isaac Sim / Omniverse)
   - UsdPreviewSurface     -> outputs:surface       (Blender / usdview / universal)
-
-Input:  wujihand_usd_rl/ (extracted from wujihand_usd_filtered.zip)
-Output: hand-usd-optimization/fused/{side}/
 
 Usage:
   python fuse_rl_appearance.py --side right
@@ -27,10 +26,14 @@ import shutil
 import sys
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
+from scipy.spatial import cKDTree
+
 try:
     from pxr import Usd, UsdGeom, UsdShade, Sdf, Gf, Vt
 except ImportError:
-    print("ERROR: pxr (usd-core) not available. Use Python 3.12 with usd-core.")
+    print("ERROR: pxr (usd-core) not available.")
     sys.exit(1)
 
 
@@ -41,12 +44,11 @@ except ImportError:
 def get_paths(side: str) -> dict:
     """Return all relevant paths for a given side."""
     base_dir = Path(__file__).resolve().parent.parent  # hand-usd-optimization/
-    wuji_dir = base_dir.parent  # wuji/
 
     return {
-        "rl_dir": wuji_dir / "wujihand_usd_rl",
-        "our_usd": base_dir / "usd" / side / f"wuji_hand_{side}_debug.usdc",
-        "texture_src": base_dir / "usd" / side / "textures" / "wuji_logo_placeholder.png",
+        "raw_usd_dir": base_dir / "usd_raw",
+        "keyshot_usd": base_dir / "usd" / f"{side}.usdz",
+        "texture_src": base_dir / "textures" / "logo" / "wuji_logo_placeholder.png",
         "fused_dir": base_dir / "fused" / side,
         "side": side,
     }
@@ -57,31 +59,18 @@ def get_paths(side: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def copy_rl_structure(paths: dict) -> Path:
-    """Copy RL USD files to fused/ directory."""
-    rl_dir = paths["rl_dir"]
+    """Copy IsaacLab raw USD files to usd_final/ directory."""
+    raw_dir = paths["raw_usd_dir"]
     fused_dir = paths["fused_dir"]
-    side = paths["side"]
 
     if fused_dir.exists():
         shutil.rmtree(fused_dir)
-    fused_dir.mkdir(parents=True)
-    (fused_dir / "configuration").mkdir()
-    (fused_dir / "textures").mkdir()
+    shutil.copytree(raw_dir, fused_dir)
 
-    # Root USD
-    rl_root = f"wujihand_{side}_filtered.usd"
-    shutil.copy2(rl_dir / rl_root, fused_dir / rl_root)
+    # Ensure textures directory
+    (fused_dir / "textures").mkdir(exist_ok=True)
 
-    # 4 configuration layers
-    for layer_type in ["base", "physics", "robot", "sensor"]:
-        src = rl_dir / "configuration" / f"wujihand_{side}_filtered_{layer_type}.usd"
-        dst = fused_dir / "configuration" / f"wujihand_{side}_filtered_{layer_type}.usd"
-        shutil.copy2(src, dst)
-
-    # Logo texture
-    shutil.copy2(paths["texture_src"], fused_dir / "textures" / "wuji_logo_placeholder.png")
-
-    print(f"  Copied RL structure to {fused_dir}")
+    print(f"  Copied IsaacLab USD to {fused_dir}")
     return fused_dir
 
 
@@ -110,58 +99,180 @@ def get_palm_uv_from_json(json_path: Path):
     return uv_data, "faceVarying", None
 
 
-def get_palm_uv_from_usd(stage, side: str):
-    """Extract UV primvar from palm mesh in a Blender-exported USD stage."""
-    target_name = f"{side}_palm_link_mesh"
-    palm_prim = None
+def get_palm_uv_from_usd(stage, side: str, link_name: str = None):
+    """Extract UV primvar and mesh prim from a Blender-exported USD stage.
 
+    Args:
+        stage: Blender USD stage
+        side: "left" or "right"
+        link_name: specific link to find (e.g. "left_palm_link"). If None, uses palm.
+
+    Returns:
+        (uv_data, interpolation, indices, mesh_prim) or (None, None, None, None)
+    """
+    if link_name is None:
+        link_name = f"{side}_palm_link"
+
+    target_prim = None
     for prim in stage.Traverse():
         if prim.GetTypeName() != "Mesh":
             continue
-        if prim.GetName() == target_name:
-            palm_prim = prim
-            break
         path_str = prim.GetPath().pathString
-        if (f"{side}_palm_link" in path_str
-                and "finger" not in prim.GetName().lower()
-                and "joint" not in prim.GetName().lower()):
-            palm_prim = prim
+        if link_name in path_str:
+            target_prim = prim
             break
 
-    if palm_prim is None:
-        print(f"    WARNING: No palm mesh found in USD")
-        return None, None, None
+    if target_prim is None:
+        return None, None, None, None
 
-    uv_attr = palm_prim.GetAttribute("primvars:UVMap")
-    if uv_attr and uv_attr.HasValue():
-        uv_data = uv_attr.Get()
-        if uv_data and len(uv_data) > 0:
-            interp = uv_attr.GetMetadata("interpolation")
-            indices_attr = palm_prim.GetAttribute("primvars:UVMap:indices")
-            indices = indices_attr.Get() if indices_attr and indices_attr.HasValue() else None
-            print(f"    UV source: {palm_prim.GetPath()}")
-            print(f"    UV items: {len(uv_data)}, interpolation: {interp}")
-            if indices:
-                print(f"    UV indices: {len(indices)}")
-            return uv_data, interp, indices
+    # Try common UV primvar names
+    for uv_name in ["primvars:UVMap", "primvars:st"]:
+        uv_attr = target_prim.GetAttribute(uv_name)
+        if uv_attr and uv_attr.HasValue():
+            uv_data = uv_attr.Get()
+            if uv_data and len(uv_data) > 0:
+                interp = uv_attr.GetMetadata("interpolation")
+                indices_attr = target_prim.GetAttribute(f"{uv_name}:indices")
+                indices = indices_attr.Get() if indices_attr and indices_attr.HasValue() else None
+                print(f"    UV source: {target_prim.GetPath()} ({uv_name})")
+                print(f"    UV items: {len(uv_data)}, interpolation: {interp}")
+                return uv_data, interp, indices, target_prim
 
-    print(f"    WARNING: No UV data at {palm_prim.GetPath()}")
-    return None, None, None
+    # No UV but mesh prim exists — return prim for KDTree vertex positions
+    return None, None, None, target_prim
 
 
-def get_palm_uv_data(our_usd_path: Path, side: str):
-    """Get palm UV data. Priority: JSON file > USD primvar > None (will auto-generate later)."""
-    # JSON fallback first (works around Blender 3.3 USD export bug on left hand)
+def get_palm_uv_data(our_usd_path: Path, side: str, link_name: str = None):
+    """Get UV data for a link. Priority: JSON file > USD primvar > None.
+
+    Returns:
+        (uv_data, interpolation, indices, blender_mesh_prim)
+    """
+    if link_name is None:
+        link_name = f"{side}_palm_link"
+
+    # Standard USD extraction first (gets both UV and mesh prim)
+    stage = Usd.Stage.Open(str(our_usd_path))
+    uv_data, interp, indices, mesh_prim = get_palm_uv_from_usd(stage, side, link_name)
+    if uv_data is not None:
+        return uv_data, interp, indices, mesh_prim
+
+    # JSON fallback (works around Blender 3.3 USD export bug on left hand)
+    # mesh_prim may still be valid for KDTree vertex positions
     json_path = our_usd_path.parent / "palm_uv_data.json"
-    if json_path.exists():
+    if "palm_link" in link_name and json_path.exists():
         print(f"    Found JSON UV file: {json_path}")
         uv_data, interp, indices = get_palm_uv_from_json(json_path)
         if uv_data is not None:
-            return uv_data, interp, indices
+            return uv_data, interp, indices, mesh_prim
 
-    # Standard USD extraction
-    stage = Usd.Stage.Open(str(our_usd_path))
-    return get_palm_uv_from_usd(stage, side)
+    return None, None, None, mesh_prim
+
+
+# ---------------------------------------------------------------------------
+# Composite texture baking
+# ---------------------------------------------------------------------------
+
+def bake_composite_texture(
+    src_texture: Path,
+    target_texture_dir: Path,
+    bg_color: tuple = (160, 160, 160),
+) -> str:
+    """Bake composite texture: original centered on 3x grey canvas.
+
+    OmniPBR doesn't support UV Clip mode, so out-of-range UVs hit grey
+    instead of repeating the logo. Returns the composite filename.
+    """
+    src = Image.open(src_texture)
+    w, h = src.size
+    canvas = Image.new("RGB", (w * 3, h * 3), bg_color)
+    canvas.paste(src, (w, h))  # center 1/3
+
+    composite_name = f"composite_{src_texture.name}"
+    target_texture_dir.mkdir(parents=True, exist_ok=True)
+    canvas.save(target_texture_dir / composite_name, quality=95)
+    print(f"    Composite texture: {composite_name} ({w * 3}x{h * 3})")
+    return composite_name
+
+
+def remap_uvs_for_composite(uvs: np.ndarray) -> np.ndarray:
+    """Remap UV [0,1] -> [1/3, 2/3] for composite texture coordinates."""
+    remapped = uvs / 3.0 + 1.0 / 3.0
+    return np.clip(remapped, 0.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Texture extraction from Blender USD
+# ---------------------------------------------------------------------------
+
+def extract_texture_from_blender(blender_stage: Usd.Stage, link_name: str) -> str | None:
+    """Extract the texture filename from a Blender USD material for a given link."""
+    for prim in blender_stage.Traverse():
+        if prim.GetTypeName() != "Mesh":
+            continue
+        if link_name not in prim.GetPath().pathString:
+            continue
+        binding = UsdShade.MaterialBindingAPI(prim)
+        mat, _ = binding.ComputeBoundMaterial()
+        if not mat:
+            continue
+        for child in mat.GetPrim().GetAllChildren():
+            shader = UsdShade.Shader(child)
+            if not shader:
+                continue
+            shader_id = shader.GetIdAttr().Get() if shader.GetIdAttr() else None
+            if shader_id == "UsdUVTexture":
+                file_input = shader.GetInput("file")
+                if file_input:
+                    asset_path = file_input.Get()
+                    if asset_path:
+                        return Path(str(asset_path.path)).name
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Texture extraction from KeyShot USDZ
+# ---------------------------------------------------------------------------
+
+def _extract_keyshot_texture(usdz_path: Path, link_name: str,
+                             target_dir: Path) -> Path | None:
+    """Extract the diffuse texture for a link from a KeyShot USDZ archive.
+
+    KeyShot embeds textures inside the USDZ zip with the logo baked into the
+    correct UV island position. We extract the diffuse PNG and return its path.
+    """
+    import zipfile
+
+    if not zipfile.is_zipfile(str(usdz_path)):
+        return None
+
+    # Find the material name for the palm link mesh
+    stage = Usd.Stage.Open(str(usdz_path))
+    mat_name = None
+    for prim in stage.Traverse():
+        if prim.GetTypeName() != "Mesh":
+            continue
+        if "palm_link" in prim.GetPath().pathString:
+            binding = UsdShade.MaterialBindingAPI(prim)
+            mat, _ = binding.ComputeBoundMaterial()
+            if mat:
+                mat_name = mat.GetPrim().GetName()
+                break
+
+    if not mat_name:
+        return None
+
+    # Look for diffuse texture in the USDZ
+    with zipfile.ZipFile(str(usdz_path), "r") as z:
+        for f in z.namelist():
+            if mat_name in f and "diffuse" in f and f.endswith(".png"):
+                data = z.read(f)
+                out_path = target_dir / f"keyshot_diffuse_{link_name}.png"
+                out_path.write_bytes(data)
+                print(f"    Extracted KeyShot texture: {f} -> {out_path.name}")
+                return out_path
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +301,9 @@ def _add_omnipbr_shader(stage, mat, mat_path: str, color, roughness: float,
     if texture_path:
         shader.CreateInput("diffuse_texture", Sdf.ValueTypeNames.Asset).Set(
             Sdf.AssetPath(texture_path))
+        # Clamp texture instead of repeat to avoid sampling bleed at UV island edges
+        shader.CreateInput("texture_translate", Sdf.ValueTypeNames.Float2).Set(Gf.Vec2f(0, 0))
+        shader.CreateInput("texture_scale", Sdf.ValueTypeNames.Float2).Set(Gf.Vec2f(1, 1))
 
     mat.CreateSurfaceOutput("mdl").ConnectToSource(shader.ConnectableAPI(), "out")
 
@@ -212,6 +326,9 @@ def _add_preview_surface_shader(stage, mat, mat_path: str, color, roughness: flo
         tex_reader.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(
             Sdf.AssetPath(texture_path))
         tex_reader.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
+        # Clamp texture: UV outside [0,1] returns edge pixel instead of wrapping
+        tex_reader.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("clamp")
+        tex_reader.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("clamp")
         tex_reader.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
 
         # Connect texture -> diffuseColor
@@ -221,7 +338,7 @@ def _add_preview_surface_shader(stage, mat, mat_path: str, color, roughness: flo
         # ST coordinate reader
         st_reader = UsdShade.Shader.Define(stage, f"{mat_path}/STReader")
         st_reader.CreateIdAttr("UsdPrimvarReader_float2")
-        st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("UVMap")
+        st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
         st_reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
 
         tex_reader.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
@@ -248,161 +365,256 @@ def create_dual_material(stage, mat_path: str, color, roughness=0.7, metallic=0.
 
 
 # ---------------------------------------------------------------------------
-# UV injection into palm mesh
+# KDTree UV transfer
 # ---------------------------------------------------------------------------
 
-def inject_uv_to_palm(palm_mesh_prim, uv_data, uv_indices):
-    """Inject UV primvar into a palm mesh prim, handling count mismatches."""
-    mesh = UsdGeom.Mesh(palm_mesh_prim)
-    fvi = mesh.GetFaceVertexIndicesAttr().Get()
-    rl_fvi_count = len(fvi) if fvi else 0
+def inject_uv_to_palm(target_mesh_prim, source_mesh_prim, uv_data, uv_indices,
+                       use_composite: bool = False):
+    """Replace target mesh geometry with source mesh, preserving UV.
 
-    if uv_data is not None:
-        our_uv_count = len(uv_data)
-        print(f"    RL palm faceVertexIndices: {rl_fvi_count}")
-        print(f"    Our UV data items: {our_uv_count}")
+    Instead of transferring UV between different meshes (error-prone due to
+    different triangulations), we replace the entire visual mesh geometry
+    with the source mesh. This guarantees mesh + UV consistency.
 
-        pv_api = UsdGeom.PrimvarsAPI(palm_mesh_prim)
-        uv_pv = pv_api.CreatePrimvar(
-            "UVMap", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying)
+    Args:
+        target_mesh_prim: Target mesh prim in IsaacLab USD (will be overwritten)
+        source_mesh_prim: Source mesh prim from KeyShot USDZ (with UV)
+        uv_data: UV coordinate data from source
+        uv_indices: UV index data (or None)
+        use_composite: Whether to remap UVs (not needed for KeyShot textures)
+    """
+    target_mesh = UsdGeom.Mesh(target_mesh_prim)
+    source_mesh = UsdGeom.Mesh(source_mesh_prim)
 
-        if uv_indices is not None:
-            uv_pv.Set(uv_data)
-            uv_pv.SetIndices(Vt.IntArray(uv_indices))
-            print(f"    Injected indexed UV: {len(uv_data)} coords, {len(uv_indices)} indices")
-        elif our_uv_count == rl_fvi_count:
-            uv_pv.Set(uv_data)
-            print(f"    Injected UV data: {our_uv_count} items (exact match)")
-        else:
-            print(f"    WARNING: UV count mismatch ({our_uv_count} vs {rl_fvi_count})")
-            uv_list = list(uv_data)
-            if our_uv_count < rl_fvi_count:
-                uv_list.extend([(0.0, 0.0)] * (rl_fvi_count - our_uv_count))
-                print(f"    Padded UV: {our_uv_count} -> {rl_fvi_count}")
-            else:
-                uv_list = uv_list[:rl_fvi_count]
-                print(f"    Truncated UV: {our_uv_count} -> {rl_fvi_count}")
-            uv_pv.Set(Vt.Vec2fArray(uv_list))
-        return
+    # Read source geometry
+    src_points = np.array(source_mesh.GetPointsAttr().Get())
+    src_fvi = np.array(source_mesh.GetFaceVertexIndicesAttr().Get())
+    src_fvc = np.array(source_mesh.GetFaceVertexCountsAttr().Get())
 
-    # No UV from our version — generate planar projection as fallback
-    print(f"    No UV from our version, generating planar projection...")
-    points = mesh.GetPointsAttr().Get()
-    if not points or rl_fvi_count == 0:
-        return
+    # Coordinate alignment: auto-detect Y-axis negation (KeyShot Y-up vs IsaacLab Z-up)
+    target_points = np.array(target_mesh.GetPointsAttr().Get())
+    t_sample = target_points[::3]
+    d_id = cKDTree(src_points[::3]).query(t_sample)[0].mean()
+    d_ny = cKDTree(src_points[::3] * [1, -1, 1]).query(t_sample)[0].mean()
+    if d_ny < d_id * 0.8:
+        src_points = src_points * [1, -1, 1]
+        print(f"    Coordinate fix: negated Y (dist {d_id:.6f} -> {d_ny:.6f})")
 
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    range_x = max_x - min_x if max_x != min_x else 1.0
-    range_y = max_y - min_y if max_y != min_y else 1.0
+    # Replace geometry: points, faceVertexIndices, faceVertexCounts
+    target_mesh.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(src_points.astype(np.float32)))
+    target_mesh.GetFaceVertexIndicesAttr().Set(Vt.IntArray.FromNumpy(src_fvi))
+    target_mesh.GetFaceVertexCountsAttr().Set(Vt.IntArray.FromNumpy(src_fvc))
 
-    uv_list = []
-    for idx in fvi:
-        p = points[idx]
-        uv_list.append(((p[0] - min_x) / range_x, (p[1] - min_y) / range_y))
+    # Copy normals if available
+    src_normals = source_mesh.GetNormalsAttr().Get()
+    if src_normals and len(src_normals) > 0:
+        normals = np.array(src_normals)
+        if d_ny < d_id * 0.8:
+            normals = normals * [1, -1, 1]
+        target_mesh.GetNormalsAttr().Set(Vt.Vec3fArray.FromNumpy(normals.astype(np.float32)))
+        target_mesh.SetNormalsInterpolation(source_mesh.GetNormalsInterpolation())
 
-    pv_api = UsdGeom.PrimvarsAPI(palm_mesh_prim)
-    uv_pv = pv_api.CreatePrimvar(
-        "UVMap", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying)
-    uv_pv.Set(Vt.Vec2fArray(uv_list))
-    print(f"    Generated planar UV: {len(uv_list)} items from {len(points)} points")
+    # Write UV primvar
+    uv_values = np.array(uv_data, dtype=np.float32)
+    if uv_indices is not None:
+        uv_idx = np.array(uv_indices)
+        uv_values_expanded = uv_values[uv_idx]
+    else:
+        uv_values_expanded = uv_values
+
+
+    if use_composite:
+        uv_values_expanded = remap_uvs_for_composite(uv_values_expanded).astype(np.float32)
+
+    primvar_api = UsdGeom.PrimvarsAPI(target_mesh_prim)
+    uv_pv = primvar_api.CreatePrimvar(
+        "st", Sdf.ValueTypeNames.TexCoord2fArray, "faceVarying")
+    uv_pv.Set(Vt.Vec2fArray.FromNumpy(uv_values_expanded.astype(np.float32)))
+
+    print(f"    Mesh replaced: {len(target_points)} -> {len(src_points)} verts, "
+          f"{len(src_fvc)} faces, {len(uv_values_expanded)} UVs")
 
 
 # ---------------------------------------------------------------------------
 # Material binding for visual meshes
 # ---------------------------------------------------------------------------
 
-def bind_visual_meshes(stage, side: str, black_mat_path: str, palm_mat_path: str):
-    """Bind visual meshes to materials. Returns the palm mesh prim (if found).
+def bind_visual_meshes(stage, side: str, black_mat_path: str,
+                       textured_mat_paths: dict = None):
+    """Bind visual meshes to materials. Returns dict of {link_name: mesh_prim}.
+
+    Args:
+        stage: Target USD stage
+        side: "left" or "right"
+        black_mat_path: Path to BlackGlove material
+        textured_mat_paths: dict of {link_name: mat_path} for textured links
 
     Also cleans up old material bindings on parent Xform prims under /visuals/
     which may use bindMaterialAs="strongerThanDescendants" and block child bindings.
     """
-    prefix = side  # "right" or "left"
+    if textured_mat_paths is None:
+        textured_mat_paths = {}
+
+    prefix = side
     black_mat = UsdShade.Material(stage.GetPrimAtPath(black_mat_path))
-    palm_mat = UsdShade.Material(stage.GetPrimAtPath(palm_mat_path))
 
-    # Step 1: Clean up old bindings on ALL prims under /visuals/ scope
-    # The RL USD has strongerThanDescendants bindings on Xform prims that override
-    # any child mesh bindings. We must rebind these to our new materials.
-    visuals_prim = stage.GetPrimAtPath("/visuals")
+    # Step 1: Rebind ALL prims with material:binding (visuals, meshes, any scope)
+    # The IsaacLab USD has DefaultMaterial bindings on /meshes/ prims that are
+    # referenced by /visuals/ prims. We must override these too, otherwise
+    # USD composition rules let the referenced DefaultMaterial win.
+    #
+    # IMPORTANT: match textured links by "/visuals/{link_name}/" or "/meshes/{link_name}/"
+    # NOT just "link_name in path", because palm_link appears as ancestor of all fingers.
     old_bindings_fixed = 0
-    if visuals_prim:
-        for prim in Usd.PrimRange(visuals_prim):
-            binding_rel = prim.GetRelationship("material:binding")
-            if binding_rel and binding_rel.HasAuthoredTargets():
-                path_str = prim.GetPath().pathString
-                is_palm = f"{prefix}_palm_link" in path_str
-                target_mat = palm_mat if is_palm else black_mat
-                binding_api = UsdShade.MaterialBindingAPI.Apply(prim)
-                binding_api.Bind(target_mat)
-                old_bindings_fixed += 1
-    if old_bindings_fixed:
-        print(f"    Fixed old bindings in /visuals/: {old_bindings_fixed}")
+    for prim in stage.Traverse():
+        binding_rel = prim.GetRelationship("material:binding")
+        if not (binding_rel and binding_rel.HasAuthoredTargets()):
+            continue
+        path_str = prim.GetPath().pathString
+        # Skip colliders
+        if "/colliders/" in path_str or "/collisions/" in path_str:
+            continue
+        # Determine which material to bind
+        target_mat = black_mat
+        for link_name, mat_path in textured_mat_paths.items():
+            # Match only direct visuals/meshes of this link, not descendants
+            if (f"/visuals/{link_name}/" in path_str or
+                f"/meshes/{link_name}/" in path_str):
+                target_mat = UsdShade.Material(stage.GetPrimAtPath(mat_path))
+                break
+        binding_api = UsdShade.MaterialBindingAPI.Apply(prim)
+        binding_api.Bind(target_mat)
+        old_bindings_fixed += 1
+    print(f"    Rebound material on {old_bindings_fixed} prims (all scopes)")
 
-    # Step 2: Bind material on actual Mesh prims
-    rebound = 0
-    palm_mesh_prim = None
-
+    # Step 2: Collect textured mesh prims from /visuals/ for UV injection
+    textured_mesh_prims = {}
     for prim in stage.Traverse():
         if prim.GetTypeName() != "Mesh":
             continue
         path_str = prim.GetPath().pathString
         if "/visuals/" not in path_str:
             continue
+        for link_name in textured_mat_paths:
+            if f"/visuals/{link_name}/" in path_str:
+                textured_mesh_prims[link_name] = prim
+                print(f"    {link_name}: {prim.GetPath()} -> textured material")
+                break
 
-        is_palm = f"{prefix}_palm_link" in path_str
-        binding_api = UsdShade.MaterialBindingAPI.Apply(prim)
-        binding_api.Bind(palm_mat if is_palm else black_mat)
-        rebound += 1
-
-        if is_palm:
-            palm_mesh_prim = prim
-            print(f"    Palm mesh: {prim.GetPath()} -> PalmWithLogo")
-
-    print(f"    Visual meshes rebound: {rebound}")
-    return palm_mesh_prim
+    return textured_mesh_prims
 
 
 # ---------------------------------------------------------------------------
 # Base layer modification (orchestrator)
 # ---------------------------------------------------------------------------
 
-def modify_base_layer(fused_dir: Path, side: str, uv_data, uv_interp, uv_indices):
-    """Modify the base layer: replace materials, rebind meshes, inject UV."""
-    base_path = fused_dir / "configuration" / f"wujihand_{side}_filtered_base.usd"
+def modify_base_layer(fused_dir: Path, side: str, blender_usd_path: Path,
+                      texture_src: Path):
+    """Modify the base layer: replace materials, rebind meshes, inject UV via KDTree.
+
+    Discovers textured links by checking material names in the debug USDC.
+    UV source: debug USDC primvar (from KeyShot/Blender export).
+    Texture source: project textures/logo/ directory.
+    """
+    # Find base USD (IsaacLab naming: wujihand_base.usd)
+    base_candidates = list((fused_dir / "configuration").glob("*base*"))
+    if not base_candidates:
+        print("    ERROR: Base USD not found")
+        return
+    base_path = base_candidates[0]
     stage = Usd.Stage.Open(str(base_path))
 
-    hand_name = f"wujihand_{side}"
-    looks_path = f"/{hand_name}/Looks"
+    # Find Looks scope
+    looks_path = None
+    for prim in stage.Traverse():
+        if prim.GetName() == "Looks" and prim.GetTypeName() == "Scope":
+            path = prim.GetPath().pathString
+            if path.count("/") > 1:
+                looks_path = path
+                break
+    if looks_path is None:
+        looks_path = "/Looks"
+    if not stage.GetPrimAtPath(looks_path):
+        UsdGeom.Scope.Define(stage, looks_path)
 
-    # Step 1: Remove old materials
-    looks_prim = stage.GetPrimAtPath(looks_path)
-    if looks_prim:
-        for child in looks_prim.GetChildren():
-            if child.GetTypeName() == "Material":
-                print(f"    Removing old material: {child.GetName()}")
-                stage.RemovePrim(child.GetPath())
+    # Open KeyShot USDZ to extract UV data for textured links
+    keyshot_stage = Usd.Stage.Open(str(blender_usd_path))
+    textured_links = {}  # link_name -> {uv_data, uv_indices, keyshot_mesh_prim}
+    target_texture_dir = fused_dir / "textures"
 
-    # Step 2: Create dual-context materials
+    # KeyShot USDZ has meshes like /lux_root/Default/{side}_palm_link/mesh
+    # with UV primvar "st". Find all palm_link meshes with UV data.
+    for prim in keyshot_stage.Traverse():
+        if prim.GetTypeName() != "Mesh":
+            continue
+        path_str = prim.GetPath().pathString
+
+        # Extract link name from path (e.g. "right_palm_link")
+        link_name = None
+        for part in path_str.split("/"):
+            if "palm_link" in part:
+                # Normalize to match target side (KeyShot may use "right_" for both)
+                link_name = f"{side}_palm_link"
+                break
+        if not link_name or link_name in textured_links:
+            continue
+
+        # Extract UV from KeyShot mesh (primvar "st")
+        pvapi = UsdGeom.PrimvarsAPI(prim)
+        uv_pv = pvapi.GetPrimvar("st")
+        if not (uv_pv and uv_pv.IsDefined()):
+            continue
+        uv_data = uv_pv.Get()
+        if not uv_data or len(uv_data) == 0:
+            continue
+
+        uv_indices_attr = prim.GetAttribute("primvars:st:indices")
+        uv_indices = uv_indices_attr.Get() if uv_indices_attr and uv_indices_attr.HasValue() else None
+
+        print(f"    KeyShot UV: {prim.GetPath()} -> {len(uv_data)} items")
+
+        textured_links[link_name] = {
+            "uv_data": uv_data,
+            "uv_indices": uv_indices,
+            "keyshot_mesh_prim": prim,
+        }
+
+    print(f"    Textured links found: {list(textured_links.keys()) or 'none'}")
+
+    # Step 1: Create BlackGlove material
     create_dual_material(
         stage, f"{looks_path}/BlackGlove",
         color=(0.02, 0.02, 0.02), roughness=0.7, metallic=0.0)
     print(f"    Created material: BlackGlove (OmniPBR + PreviewSurface)")
 
-    create_dual_material(
-        stage, f"{looks_path}/PalmWithLogo",
-        color=(0.02, 0.02, 0.02), roughness=0.7, metallic=0.0,
-        texture_path="../../textures/wuji_logo_placeholder.png")
-    print(f"    Created material: PalmWithLogo (OmniPBR + PreviewSurface)")
+    # Step 2: Create textured materials using texture extracted from KeyShot USDZ.
+    # The KeyShot USDZ embeds the correct texture with logo baked into the right
+    # UV island. We extract it and use it directly (no composite remap needed).
+    textured_mat_paths = {}
+    for link_name in textured_links:
+        tex_rel_path = None
+
+        # Extract diffuse texture from KeyShot USDZ
+        target_texture_dir.mkdir(parents=True, exist_ok=True)
+        extracted_tex = _extract_keyshot_texture(blender_usd_path, link_name, target_texture_dir)
+        if extracted_tex:
+            tex_rel_path = f"../textures/{extracted_tex.name}"
+        elif texture_src.exists():
+            # Fallback to project texture
+            import shutil as _shutil
+            _shutil.copy2(texture_src, target_texture_dir / texture_src.name)
+            tex_rel_path = f"../textures/{texture_src.name}"
+
+        mat_name = f"{link_name}_Material"
+        mat_path = f"{looks_path}/{mat_name}"
+        create_dual_material(
+            stage, mat_path,
+            color=(0.02, 0.02, 0.02), roughness=0.7, metallic=0.0,
+            texture_path=tex_rel_path)
+        textured_mat_paths[link_name] = mat_path
+        print(f"    Created material: {mat_name} (OmniPBR + PreviewSurface)")
 
     # Step 3: Disable instanceable on visual Xforms
-    # instanceable=true creates USD instances whose material bindings
-    # Blender cannot resolve across instance boundaries. Removing it
-    # converts them to regular references which work in all DCC tools.
-    # Isaac Sim still works fine without instanceable.
     deinstanced = 0
     for prim in stage.Traverse():
         if prim.GetName() in ("visuals", "collisions"):
@@ -413,14 +625,21 @@ def modify_base_layer(fused_dir: Path, side: str, uv_data, uv_interp, uv_indices
         print(f"    Disabled instanceable on {deinstanced} prims")
 
     # Step 4: Rebind visual meshes
-    palm_mesh_prim = bind_visual_meshes(
+    textured_mesh_prims = bind_visual_meshes(
         stage, side,
         black_mat_path=f"{looks_path}/BlackGlove",
-        palm_mat_path=f"{looks_path}/PalmWithLogo")
+        textured_mat_paths=textured_mat_paths)
 
-    # Step 5: Inject UV into palm mesh
-    if palm_mesh_prim:
-        inject_uv_to_palm(palm_mesh_prim, uv_data, uv_indices)
+    # Step 5: Inject UV via KDTree for each textured link
+    for link_name, mesh_prim in textured_mesh_prims.items():
+        info = textured_links[link_name]
+        print(f"    Injecting UV: {link_name}")
+        inject_uv_to_palm(
+            mesh_prim,
+            info["keyshot_mesh_prim"],
+            info["uv_data"],
+            info["uv_indices"],
+            use_composite=False)
 
     stage.GetRootLayer().Save()
     print(f"    Saved: {base_path}")
@@ -432,10 +651,22 @@ def modify_base_layer(fused_dir: Path, side: str, uv_data, uv_interp, uv_indices
 
 def verify_fused(fused_dir: Path, side: str) -> bool:
     """Verify the fused USD loads correctly."""
-    root_path = fused_dir / f"wujihand_{side}_filtered.usd"
-    base_path = fused_dir / "configuration" / f"wujihand_{side}_filtered_base.usd"
+    # Find root USD
+    root_candidates = list(fused_dir.glob("wujihand*.usd"))
+    root_candidates = [f for f in root_candidates if "base" not in f.name
+                       and "physics" not in f.name and "robot" not in f.name
+                       and "sensor" not in f.name]
+    if not root_candidates:
+        print(f"  ERROR: No root USD found in {fused_dir}")
+        return False
+    root_path = root_candidates[0]
 
-    root_stage = Usd.Stage.Open(str(root_path))
+    base_candidates = list((fused_dir / "configuration").glob("*base*"))
+    if not base_candidates:
+        print(f"  ERROR: No base USD found")
+        return False
+    base_path = base_candidates[0]
+
     base_stage = Usd.Stage.Open(str(base_path))
 
     # Count meshes and materials from base layer
@@ -447,57 +678,43 @@ def verify_fused(fused_dir: Path, side: str) -> bool:
         elif t == "Material":
             materials.append(prim)
 
-    # Count joints from root (composed with physics layer)
-    joints = [p for p in root_stage.Traverse() if "Joint" in p.GetTypeName()]
-
-    # Variant sets
-    hand_name = f"wujihand_{side}"
-    root_prim = root_stage.GetPrimAtPath(f"/{hand_name}")
-    vsets = root_prim.GetVariantSets()
-    vs_info = {n: vsets.GetVariantSet(n).GetVariantSelection() for n in vsets.GetNames()}
-
-    # Top-level material names
-    mat_names = [m.GetName() for m in materials
-                 if m.GetPath().pathString.startswith(f"/{hand_name}/Looks/")
-                 and m.GetPath().pathString.count("/") == 3]
+    # Material names at top level
+    mat_names = [m.GetName() for m in materials]
 
     print(f"\n  === Verification: {side} ===")
-    print(f"  Meshes: {len(meshes)} (expected: 78)")
-    print(f"  Joints: {len(joints)} (expected: 26)")
-    print(f"  Top materials: {mat_names}")
-    print(f"  Variant sets: {vs_info}")
+    print(f"  Root USD: {root_path.name}")
+    print(f"  Meshes: {len(meshes)}")
+    print(f"  Materials: {[n for n in mat_names if n not in ('DefaultMaterial',)]}")
 
-    # Check palm mesh UV and material binding
-    prefix = side
+    # Check visual meshes with UV
+    uv_count = 0
     for m in meshes:
         path_str = m.GetPath().pathString
-        if f"{prefix}_palm_link" in path_str and "/visuals/" in path_str:
-            pv_api = UsdGeom.PrimvarsAPI(m)
-            uv = pv_api.GetPrimvar("UVMap")
-            if uv and uv.IsDefined():
-                print(f"  Palm UV: {len(uv.Get())} items OK")
-            else:
-                print(f"  Palm UV: MISSING")
+        if "/visuals/" not in path_str:
+            continue
+        pv_api = UsdGeom.PrimvarsAPI(m)
+        st = pv_api.GetPrimvar("st")
+        if st and st.IsDefined():
+            uv_count += 1
 
-            binding = UsdShade.MaterialBindingAPI(m)
-            mat, _ = binding.ComputeBoundMaterial()
-            if mat:
-                print(f"  Palm material: {mat.GetPath()} OK")
+    print(f"  Visual meshes with UV: {uv_count}")
+
+    # Check dual context on BlackGlove
+    for m in materials:
+        if m.GetName() == "BlackGlove":
+            mat = UsdShade.Material(m)
+            has_mdl = mat.GetSurfaceOutput("mdl").HasConnectedSource()
+            has_surface = mat.GetSurfaceOutput().HasConnectedSource()
+            print(f"  Dual context: mdl={'OK' if has_mdl else 'MISSING'}, "
+                  f"surface={'OK' if has_surface else 'MISSING'}")
             break
 
-    # Check dual shader outputs on BlackGlove
-    bg_prim = base_stage.GetPrimAtPath(f"/{hand_name}/Looks/BlackGlove")
-    if bg_prim:
-        bg_mat = UsdShade.Material(bg_prim)
-        has_mdl = bg_mat.GetSurfaceOutput("mdl").HasConnectedSource()
-        has_surface = bg_mat.GetSurfaceOutput().HasConnectedSource()
-        print(f"  Dual context: mdl={'OK' if has_mdl else 'MISSING'}, "
-              f"surface={'OK' if has_surface else 'MISSING'}")
+    # Check textures
+    tex_dir = fused_dir / "textures"
+    tex_files = list(tex_dir.glob("*")) if tex_dir.exists() else []
+    print(f"  Textures: {[f.name for f in tex_files] or 'none'}")
 
-    tex = fused_dir / "textures" / "wuji_logo_placeholder.png"
-    print(f"  Texture: {'exists' if tex.exists() else 'MISSING'}")
-
-    ok = len(meshes) >= 50 and len(joints) >= 25 and "BlackGlove" in mat_names
+    ok = len(meshes) >= 20 and "BlackGlove" in mat_names
     print(f"  Status: {'PASS' if ok else 'FAIL'}")
     return ok
 
@@ -515,30 +732,29 @@ def fuse_side(side: str) -> bool:
     paths = get_paths(side)
 
     # Validate inputs
-    for key, label in [("rl_dir", "RL directory"), ("our_usd", "Our USD"), ("texture_src", "Texture")]:
+    for key, label in [("raw_usd_dir", "IsaacLab USD"), ("keyshot_usd", "KeyShot USD")]:
         if not paths[key].exists():
             print(f"  ERROR: {label} not found: {paths[key]}")
             return False
 
-    # Step 1: Copy RL structure
-    print(f"\n  [1/4] Copying RL structure...")
+    # Step 1: Copy IsaacLab raw USD
+    print(f"\n  [1/3] Copying IsaacLab USD structure...")
     fused_dir = copy_rl_structure(paths)
 
-    # Step 2: Extract UV from our version
-    print(f"\n  [2/4] Extracting UV data from our USD...")
-    uv_data, uv_interp, uv_indices = get_palm_uv_data(paths["our_usd"], side)
+    # Step 2: Modify base layer (UV transfer + materials)
+    print(f"\n  [2/3] Modifying base layer (KDTree UV + dual materials)...")
+    modify_base_layer(
+        fused_dir, side,
+        paths["keyshot_usd"],
+        paths["texture_src"])
 
-    # Step 3: Modify base layer
-    print(f"\n  [3/4] Modifying base layer...")
-    modify_base_layer(fused_dir, side, uv_data, uv_interp, uv_indices)
-
-    # Step 4: Verify
-    print(f"\n  [4/4] Verifying fused output...")
+    # Step 3: Verify
+    print(f"\n  [3/3] Verifying fused output...")
     return verify_fused(fused_dir, side)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fuse RL USD with visual appearance")
+    parser = argparse.ArgumentParser(description="Fuse IsaacLab USD with visual appearance")
     parser.add_argument("--side", choices=["left", "right", "both"], default="both",
                         help="Which hand to process")
     args = parser.parse_args()

@@ -3,3 +3,5 @@ __pycache__/
 .DS_Store
 .vscode/
 .claude/
+usd_raw/
+usd_final/
