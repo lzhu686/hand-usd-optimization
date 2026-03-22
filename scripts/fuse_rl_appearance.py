@@ -47,8 +47,9 @@ def get_paths(side: str) -> dict:
 
     return {
         "raw_usd_dir": base_dir / "usd_raw",
-        "keyshot_usd": base_dir / "usd" / f"{side}.usdz",
+        "uv_source": base_dir / "usd" / side / f"wuji_hand_{side}_debug.usdc",
         "texture_src": base_dir / "textures" / "logo" / "wuji_logo_placeholder.png",
+        "blender_texture_dir": base_dir / "usd" / side / "textures",
         "fused_dir": base_dir / "fused" / side,
         "side": side,
     }
@@ -205,74 +206,6 @@ def remap_uvs_for_composite(uvs: np.ndarray) -> np.ndarray:
 # Texture extraction from Blender USD
 # ---------------------------------------------------------------------------
 
-def extract_texture_from_blender(blender_stage: Usd.Stage, link_name: str) -> str | None:
-    """Extract the texture filename from a Blender USD material for a given link."""
-    for prim in blender_stage.Traverse():
-        if prim.GetTypeName() != "Mesh":
-            continue
-        if link_name not in prim.GetPath().pathString:
-            continue
-        binding = UsdShade.MaterialBindingAPI(prim)
-        mat, _ = binding.ComputeBoundMaterial()
-        if not mat:
-            continue
-        for child in mat.GetPrim().GetAllChildren():
-            shader = UsdShade.Shader(child)
-            if not shader:
-                continue
-            shader_id = shader.GetIdAttr().Get() if shader.GetIdAttr() else None
-            if shader_id == "UsdUVTexture":
-                file_input = shader.GetInput("file")
-                if file_input:
-                    asset_path = file_input.Get()
-                    if asset_path:
-                        return Path(str(asset_path.path)).name
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Texture extraction from KeyShot USDZ
-# ---------------------------------------------------------------------------
-
-def _extract_keyshot_texture(usdz_path: Path, link_name: str,
-                             target_dir: Path) -> Path | None:
-    """Extract the diffuse texture for a link from a KeyShot USDZ archive.
-
-    KeyShot embeds textures inside the USDZ zip with the logo baked into the
-    correct UV island position. We extract the diffuse PNG and return its path.
-    """
-    import zipfile
-
-    if not zipfile.is_zipfile(str(usdz_path)):
-        return None
-
-    # Find the material name for the palm link mesh
-    stage = Usd.Stage.Open(str(usdz_path))
-    mat_name = None
-    for prim in stage.Traverse():
-        if prim.GetTypeName() != "Mesh":
-            continue
-        if "palm_link" in prim.GetPath().pathString:
-            binding = UsdShade.MaterialBindingAPI(prim)
-            mat, _ = binding.ComputeBoundMaterial()
-            if mat:
-                mat_name = mat.GetPrim().GetName()
-                break
-
-    if not mat_name:
-        return None
-
-    # Look for diffuse texture in the USDZ
-    with zipfile.ZipFile(str(usdz_path), "r") as z:
-        for f in z.namelist():
-            if mat_name in f and "diffuse" in f and f.endswith(".png"):
-                data = z.read(f)
-                out_path = target_dir / f"keyshot_diffuse_{link_name}.png"
-                out_path.write_bytes(data)
-                print(f"    Extracted KeyShot texture: {f} -> {out_path.name}")
-                return out_path
-
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -509,12 +442,12 @@ def bind_visual_meshes(stage, side: str, black_mat_path: str,
 # ---------------------------------------------------------------------------
 
 def modify_base_layer(fused_dir: Path, side: str, blender_usd_path: Path,
-                      texture_src: Path):
-    """Modify the base layer: replace materials, rebind meshes, inject UV via KDTree.
+                      texture_src: Path, blender_texture_dir: Path = None):
+    """Modify the base layer: replace visual mesh + materials.
 
-    Discovers textured links by checking material names in the debug USDC.
-    UV source: debug USDC primvar (from KeyShot/Blender export).
-    Texture source: project textures/logo/ directory.
+    Discovers textured links by checking material names in the source USD.
+    Supports both KeyShot USDZ and Blender USDC as UV/mesh source.
+    Texture priority: embedded in USDZ > blender texture dir > project textures/logo/.
     """
     # Find base USD (IsaacLab naming: wujihand_base.usd)
     base_candidates = list((fused_dir / "configuration").glob("*base*"))
@@ -587,23 +520,28 @@ def modify_base_layer(fused_dir: Path, side: str, blender_usd_path: Path,
         color=(0.02, 0.02, 0.02), roughness=0.7, metallic=0.0)
     print(f"    Created material: BlackGlove (OmniPBR + PreviewSurface)")
 
-    # Step 2: Create textured materials using texture extracted from KeyShot USDZ.
-    # The KeyShot USDZ embeds the correct texture with logo baked into the right
-    # UV island. We extract it and use it directly (no composite remap needed).
+    # Step 2: Create textured materials.
+    # Texture priority: USDZ embedded > Blender textures dir > project textures/logo/
     textured_mat_paths = {}
     for link_name in textured_links:
         tex_rel_path = None
-
-        # Extract diffuse texture from KeyShot USDZ
         target_texture_dir.mkdir(parents=True, exist_ok=True)
-        extracted_tex = _extract_keyshot_texture(blender_usd_path, link_name, target_texture_dir)
-        if extracted_tex:
-            tex_rel_path = f"../textures/{extracted_tex.name}"
-        elif texture_src.exists():
-            # Fallback to project texture
+
+        # Try 1: Blender textures directory (next to .usdc)
+        if blender_texture_dir and blender_texture_dir.exists():
+            for tex_file in blender_texture_dir.glob("*.png"):
+                import shutil as _shutil
+                _shutil.copy2(tex_file, target_texture_dir / tex_file.name)
+                tex_rel_path = f"../textures/{tex_file.name}"
+                print(f"    Texture from Blender: {tex_file.name}")
+                break
+
+        # Try 3: Project fallback
+        if not tex_rel_path and texture_src.exists():
             import shutil as _shutil
             _shutil.copy2(texture_src, target_texture_dir / texture_src.name)
             tex_rel_path = f"../textures/{texture_src.name}"
+            print(f"    Texture fallback: {texture_src.name}")
 
         mat_name = f"{link_name}_Material"
         mat_path = f"{looks_path}/{mat_name}"
@@ -732,21 +670,29 @@ def fuse_side(side: str) -> bool:
     paths = get_paths(side)
 
     # Validate inputs
-    for key, label in [("raw_usd_dir", "IsaacLab USD"), ("keyshot_usd", "KeyShot USD")]:
-        if not paths[key].exists():
-            print(f"  ERROR: {label} not found: {paths[key]}")
-            return False
+    if not paths["raw_usd_dir"].exists():
+        print(f"  ERROR: IsaacLab USD not found: {paths['raw_usd_dir']}")
+        return False
+    if not paths["uv_source"]:
+        print(f"  ERROR: No UV source (USDZ or USDC) found")
+        return False
+    if not paths["uv_source"].exists():
+        print(f"  ERROR: UV source not found: {paths['uv_source']}")
+        return False
+
+    print(f"  UV source: {paths['uv_source']}")
 
     # Step 1: Copy IsaacLab raw USD
     print(f"\n  [1/3] Copying IsaacLab USD structure...")
     fused_dir = copy_rl_structure(paths)
 
-    # Step 2: Modify base layer (UV transfer + materials)
-    print(f"\n  [2/3] Modifying base layer (KDTree UV + dual materials)...")
+    # Step 2: Modify base layer (mesh replacement + materials)
+    print(f"\n  [2/3] Modifying base layer (mesh replace + dual materials)...")
     modify_base_layer(
         fused_dir, side,
-        paths["keyshot_usd"],
-        paths["texture_src"])
+        paths["uv_source"],
+        paths["texture_src"],
+        paths.get("blender_texture_dir"))
 
     # Step 3: Verify
     print(f"\n  [3/3] Verifying fused output...")
