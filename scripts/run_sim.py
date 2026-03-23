@@ -22,10 +22,8 @@ import subprocess
 import sys
 
 import numpy as np
-import omni.usd
 import torch
 from pathlib import Path
-from pxr import UsdPhysics
 
 import isaaclab.sim as sim_utils
 import isaacsim.core.utils.prims as prim_utils
@@ -34,7 +32,6 @@ from isaaclab.utils.math import saturate
 
 from urdf_to_usd import (
     FINAL_USD_DIR,
-    RAW_USD_DIR,
     USD_FILE_NAME,
     convert_urdf_to_usd,
     get_wujihand_config,
@@ -49,7 +46,7 @@ def prepare_usd(force: bool = False):
     1. URDF -> raw USD (IsaacLab UrdfConverter)
     2. raw USD + Blender appearance -> final USD (fuse_rl_appearance.py)
     """
-    final_usd = FINAL_USD_DIR / f"{USD_FILE_NAME}.usd"
+    final_usd = FINAL_USD_DIR / HAND_SIDE / f"{USD_FILE_NAME}.usd"
 
     if final_usd.exists() and not force:
         print(f"[prepare] Final USD exists: {final_usd} (use --regenerate to force)")
@@ -65,7 +62,8 @@ def prepare_usd(force: bool = False):
     cmd = [
         sys.executable,
         str(fuse_script),
-        "--side", HAND_SIDE,
+        "--side",
+        HAND_SIDE,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -83,38 +81,8 @@ def design_scene():
     cfg.func("/World/light", cfg)
 
     prim_utils.create_prim("/World/hand", "Xform")
-    hand_cfg = get_wujihand_config(HAND_SIDE).replace(
-        prim_path="/World/hand/WujiHand"
-    )
+    hand_cfg = get_wujihand_config(HAND_SIDE).replace(prim_path="/World/hand/WujiHand")
     hand = Articulation(cfg=hand_cfg)
-
-    # Filter collisions between palm and finger link2
-    stage = omni.usd.get_context().get_stage()
-    base_path = "/World/hand/WujiHand"
-    palm_candidates = [
-        f"{base_path}/{HAND_SIDE}_palm_link",
-        f"{base_path}/wujihand/{HAND_SIDE}_palm_link",
-    ]
-    palm_prim = None
-    base_prefix = base_path
-    for p in palm_candidates:
-        palm_prim = stage.GetPrimAtPath(p)
-        if palm_prim:
-            base_prefix = p.replace(f"/{HAND_SIDE}_palm_link", "")
-            break
-
-    if palm_prim:
-        filtered_api = UsdPhysics.FilteredPairsAPI.Apply(palm_prim)
-        filtered_rel = filtered_api.CreateFilteredPairsRel()
-        for i in range(1, 6):
-            finger_prim = stage.GetPrimAtPath(
-                f"{base_prefix}/{HAND_SIDE}_finger{i}_link2"
-            )
-            if finger_prim:
-                filtered_rel.AddTarget(finger_prim.GetPath())
-    else:
-        print("[WARNING] palm_link prim not found, skipping collision filter")
-
     return hand
 
 
@@ -125,9 +93,7 @@ def run_simulator(sim, hand):
 
     trajectory = np.load(Path(__file__).parent.parent / "data" / "wave.npy")
     mujoco_joints = [
-        f"{HAND_SIDE}_finger{i}_joint{j}"
-        for i in range(1, 6)
-        for j in range(1, 5)
+        f"{HAND_SIDE}_finger{i}_joint{j}" for i in range(1, 6) for j in range(1, 5)
     ]
 
     joint_name_to_idx = {name: idx for idx, name in enumerate(hand.joint_names)}

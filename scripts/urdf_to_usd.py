@@ -23,17 +23,18 @@ from isaaclab.assets.articulation import ArticulationCfg
 # Path resolution
 # ---------------------------------------------------------------------------
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent       # hand-usd-optimization/
+PROJECT_DIR = Path(__file__).resolve().parent.parent  # hand-usd-optimization/
 URDF_DIR = PROJECT_DIR.parent / "wuji-hand-description" / "urdf"
 RAW_USD_DIR = PROJECT_DIR / "usd_raw"
 FINAL_USD_DIR = PROJECT_DIR / "fused"
-BLENDER_USD_DIR = PROJECT_DIR / "usd"                     # Blender debug exports (UV source)
+BLENDER_USD_DIR = PROJECT_DIR / "usd"  # Blender debug exports (UV source)
 USD_FILE_NAME = "wujihand"
 
 
 # ---------------------------------------------------------------------------
 # Hand parameters
 # ---------------------------------------------------------------------------
+
 
 def get_hand_params(hand_side: str) -> dict:
     """Return control parameters (PD gains, effort limits) for the hand."""
@@ -58,6 +59,7 @@ def get_hand_params(hand_side: str) -> dict:
 # URDF -> USD conversion via IsaacLab
 # ---------------------------------------------------------------------------
 
+
 def convert_urdf_to_usd(hand_side: str) -> Path:
     """Convert URDF to USD via IsaacLab UrdfConverter.
 
@@ -68,12 +70,13 @@ def convert_urdf_to_usd(hand_side: str) -> Path:
 
     urdf_path = str(URDF_DIR / f"{hand_side}.urdf")
     params = get_hand_params(hand_side)
+    raw_usd_dir = RAW_USD_DIR / hand_side
 
-    print(f"Converting {hand_side} hand: {urdf_path} -> {RAW_USD_DIR}")
+    print(f"Converting {hand_side} hand: {urdf_path} -> {raw_usd_dir}")
 
     cfg = UrdfConverterCfg(
         asset_path=urdf_path,
-        usd_dir=str(RAW_USD_DIR),
+        usd_dir=str(raw_usd_dir),
         usd_file_name=USD_FILE_NAME,
         force_usd_conversion=True,
         fix_base=True,
@@ -93,13 +96,14 @@ def convert_urdf_to_usd(hand_side: str) -> Path:
     )
 
     UrdfConverter(cfg)
-    print(f"  Done: {RAW_USD_DIR}")
-    return RAW_USD_DIR
+    print(f"  Done: {raw_usd_dir}")
+    return raw_usd_dir
 
 
 # ---------------------------------------------------------------------------
 # ArticulationCfg for IsaacSim
 # ---------------------------------------------------------------------------
+
 
 def get_wujihand_config(hand_side: str) -> ArticulationCfg:
     """Return ArticulationCfg using the final (post-processed) USD."""
@@ -147,10 +151,15 @@ def get_wujihand_config(hand_side: str) -> ArticulationCfg:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(description="Convert Wuji Hand URDF to USD")
-    parser.add_argument("--side", choices=["right", "left", "both"], default="both",
-                        help="Which hand to convert")
+    parser.add_argument(
+        "--side",
+        choices=["right", "left", "both"],
+        default="both",
+        help="Which hand to convert",
+    )
     args = parser.parse_args()
 
     if not URDF_DIR.exists():

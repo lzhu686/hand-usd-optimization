@@ -148,7 +148,11 @@ def create_empty(name, collection):
 
 def import_stl(filepath, name, collection):
     """Import a single STL file, rename it, and move to target collection."""
-    bpy.ops.import_mesh.stl(filepath=str(filepath))
+    # Blender 4.x+: bpy.ops.wm.stl_import; older: bpy.ops.import_mesh.stl
+    if hasattr(bpy.ops.wm, "stl_import"):
+        bpy.ops.wm.stl_import(filepath=str(filepath))
+    else:
+        bpy.ops.import_mesh.stl(filepath=str(filepath))
     obj = bpy.context.active_object
     obj.name = name
     obj.data.name = name + "_mesh"
@@ -239,34 +243,122 @@ def build_hand(links, joints, root_link, stl_dir, side):
 # =============================================================================
 
 
-def uv_unwrap_all(link_objects, palm_link_name):
-    """UV unwrap all meshes using Smart UV Project."""
-    # Deselect everything first
+def uv_unwrap_palm(obj, side):
+    """UV unwrap palm link: logo on back-of-hand, rest compressed to corner.
+
+    Back-of-hand faces (normal pointing -X for right, +X for left) get a
+    planar projection filling the UV [0.1, 0.9] range for the logo texture.
+    All other faces get their UVs compressed to ~(0.03, 0.02) — the black
+    region of the texture.
+    """
+    import bmesh
+
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+    uv_layer = bm.loops.layers.uv.verify()
+
+    # Back-of-hand: faces with near-pure -X normal for BOTH hands.
+    # Left and right hands share the same -X back direction (mirrored on Y axis only).
+    # Reference from old .blend: 24 faces, normal.x in [-0.997, -0.977],
+    # 3D center: y=[-0.012, 0.013], z=[0.009, 0.017]
+    normal_threshold = 0.97  # very flat faces only
+
+    # Classify faces: logo region = strict normal + 3D position filter
+    back_faces = []
+    other_faces = []
+    for face in bm.faces:
+        is_back_normal = face.normal.x < -normal_threshold
+        # Restrict to the center of the hand back (z range ~[0.005, 0.025])
+        cz = face.calc_center_median().z
+        is_logo_region = 0.005 < cz < 0.025
+        if is_back_normal and is_logo_region:
+            back_faces.append(face)
+        else:
+            other_faces.append(face)
+
+    print(f"  Palm UV: {len(back_faces)} logo faces, {len(other_faces)} other faces")
+
+    # Project logo faces: match old .blend UV layout
+    # Old: u=[0.005, 1.026], v=[0.306, 0.720], center=(0.553, 0.504)
+    if back_faces:
+        y_vals = [v.co.y for f in back_faces for v in f.verts]
+        z_vals = [v.co.z for f in back_faces for v in f.verts]
+        y_min, y_max = min(y_vals), max(y_vals)
+        z_min, z_max = min(z_vals), max(z_vals)
+        y_range = y_max - y_min or 1e-6
+        z_range = z_max - z_min or 1e-6
+
+        # Map to UV: u spans ~[0.0, 1.0], v spans ~[0.30, 0.72]
+        # Use aspect-preserving projection
+        scale = max(y_range, z_range)
+
+        # Use mounting hole midpoint as Y center (symmetry axis of the hand)
+        # Find two bottom-most vertex clusters for hole centers
+        all_z = [v.co.z for v in bm.verts]
+        z_min_all, z_max_all = min(all_z), max(all_z)
+        z_bottom = z_min_all + (z_max_all - z_min_all) * 0.05
+        bottom_verts = [v for v in bm.verts if v.co.z < z_bottom]
+        if len(bottom_verts) >= 2:
+            by = sorted(bottom_verts, key=lambda v: v.co.y)
+            ys = [v.co.y for v in by]
+            gaps = [(ys[i+1] - ys[i], i) for i in range(len(ys)-1)]
+            split_idx = max(gaps, key=lambda x: x[0])[1]
+            c1_y = sum(v.co.y for v in by[:split_idx+1]) / (split_idx+1)
+            c2_y = sum(v.co.y for v in by[split_idx+1:]) / (len(by)-split_idx-1)
+            y_center = (c1_y + c2_y) / 2
+            print(f"  Mounting holes Y: {c1_y:.5f}, {c2_y:.5f}, midpoint={y_center:.5f}")
+        else:
+            y_center = (y_min + y_max) / 2
+
+        z_center = (z_min + z_max) / 2
+
+        # Target UV region matching old .blend
+        # Old mapping: U is inversely proportional to Y, V proportional to Z
+        u_center, v_center = 0.50, 0.55
+        uv_scale = 1.6  # larger = UV island covers more of texture = logo appears smaller
+
+        # Both hands: back is -X direction, Y maps inversely to U
+        for face in back_faces:
+            for loop in face.loops:
+                co = loop.vert.co
+                u = u_center - ((co.y - y_center) / scale) * uv_scale
+                v = v_center + ((co.z - z_center) / scale) * uv_scale
+                loop[uv_layer].uv = (u, v)
+
+    # Compress other faces to corner (black area of texture)
+    for face in other_faces:
+        for loop in face.loops:
+            loop[uv_layer].uv = (0.03, 0.02)
+
+    bmesh.update_edit_mesh(obj.data)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    obj.select_set(False)
+
+
+def uv_unwrap_all(link_objects, palm_link_name, side):
+    """UV unwrap all meshes. Palm gets special logo projection, rest get Smart UV."""
     bpy.ops.object.select_all(action="DESELECT")
 
     for link_name, obj in link_objects.items():
-        bpy.context.view_layer.objects.active = obj
-        obj.select_set(True)
-        bpy.ops.object.mode_set(mode="EDIT")
-        bpy.ops.mesh.select_all(action="SELECT")
-
         if link_name == palm_link_name:
-            bpy.ops.uv.smart_project(
-                angle_limit=math.radians(66),
-                island_margin=0.02,
-                correct_aspect=True,
-                scale_to_bounds=False,
-            )
+            uv_unwrap_palm(obj, side)
         else:
+            bpy.context.view_layer.objects.active = obj
+            obj.select_set(True)
+            bpy.ops.object.mode_set(mode="EDIT")
+            bpy.ops.mesh.select_all(action="SELECT")
             bpy.ops.uv.smart_project(
                 angle_limit=math.radians(66),
                 island_margin=0.01,
                 correct_aspect=True,
                 scale_to_bounds=False,
             )
-
-        bpy.ops.object.mode_set(mode="OBJECT")
-        obj.select_set(False)
+            bpy.ops.object.mode_set(mode="OBJECT")
+            obj.select_set(False)
 
     print(f"  UV unwrap complete for {len(link_objects)} meshes")
 
@@ -274,6 +366,14 @@ def uv_unwrap_all(link_objects, palm_link_name):
 # =============================================================================
 # Material Creation
 # =============================================================================
+
+
+def _set_specular(principled, value=0.3):
+    """Set Specular with Blender version compat (5.x renamed to Specular IOR Level)."""
+    if "Specular IOR Level" in principled.inputs:
+        principled.inputs["Specular IOR Level"].default_value = value
+    elif "Specular" in principled.inputs:
+        principled.inputs["Specular"].default_value = value
 
 
 def create_black_glove_material():
@@ -293,7 +393,7 @@ def create_black_glove_material():
     principled.inputs["Base Color"].default_value = (0.02, 0.02, 0.02, 1.0)
     principled.inputs["Roughness"].default_value = 0.7
     principled.inputs["Metallic"].default_value = 0.0
-    principled.inputs["Specular"].default_value = 0.3
+    _set_specular(principled)
 
     links.new(principled.outputs["BSDF"], output.inputs["Surface"])
     return mat
@@ -320,7 +420,7 @@ def create_palm_logo_material(logo_texture_path):
     principled.location = (300, 0)
     principled.inputs["Roughness"].default_value = 0.7
     principled.inputs["Metallic"].default_value = 0.0
-    principled.inputs["Specular"].default_value = 0.3
+    _set_specular(principled)
 
     links.new(principled.outputs["BSDF"], output.inputs["Surface"])
 
@@ -332,16 +432,26 @@ def create_palm_logo_material(logo_texture_path):
         tex_image = nodes.new("ShaderNodeTexImage")
         tex_image.location = (-600, 0)
         tex_image.image = img
+        tex_image.extension = "CLIP"
 
-        # MixRGB: blend logo (Color2) over black base (Color1) using alpha
-        mix = nodes.new("ShaderNodeMixRGB")
-        mix.location = (0, 0)
-        mix.blend_type = "MIX"
-        mix.inputs["Color1"].default_value = (0.02, 0.02, 0.02, 1.0)
-
-        links.new(tex_image.outputs["Color"], mix.inputs["Color2"])
-        links.new(tex_image.outputs["Alpha"], mix.inputs["Fac"])
-        links.new(mix.outputs["Color"], principled.inputs["Base Color"])
+        # Mix node: blend logo over black base using alpha
+        # Blender 4.x+: ShaderNodeMix; older: ShaderNodeMixRGB
+        if hasattr(bpy.types, "ShaderNodeMix"):
+            mix = nodes.new("ShaderNodeMix")
+            mix.data_type = "RGBA"
+            mix.location = (0, 0)
+            mix.inputs["A"].default_value = (0.02, 0.02, 0.02, 1.0)
+            links.new(tex_image.outputs["Color"], mix.inputs["B"])
+            links.new(tex_image.outputs["Alpha"], mix.inputs["Factor"])
+            links.new(mix.outputs["Result"], principled.inputs["Base Color"])
+        else:
+            mix = nodes.new("ShaderNodeMixRGB")
+            mix.location = (0, 0)
+            mix.blend_type = "MIX"
+            mix.inputs["Color1"].default_value = (0.02, 0.02, 0.02, 1.0)
+            links.new(tex_image.outputs["Color"], mix.inputs["Color2"])
+            links.new(tex_image.outputs["Alpha"], mix.inputs["Fac"])
+            links.new(mix.outputs["Color"], principled.inputs["Base Color"])
 
         print(f"  Logo texture loaded: {logo_path}")
     else:
@@ -374,10 +484,9 @@ def export_usd(output_path):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    bpy.ops.wm.usd_export(
+    export_kwargs = dict(
         filepath=str(output_path),
         selected_objects_only=False,
-        visible_objects_only=True,
         export_animation=False,
         export_hair=False,
         export_uvmaps=True,
@@ -386,10 +495,17 @@ def export_usd(output_path):
         use_instancing=False,
         evaluation_mode="RENDER",
         generate_preview_surface=True,
-        export_textures=True,
         overwrite_textures=True,
         relative_paths=True,
     )
+    # Blender 5.x renamed export_textures -> export_textures_mode
+    usd_props = {p.identifier for p in bpy.ops.wm.usd_export.get_rna_type().properties}
+    if "export_textures_mode" in usd_props:
+        export_kwargs["export_textures_mode"] = "NEW"
+    elif "export_textures" in usd_props:
+        export_kwargs["export_textures"] = True
+
+    bpy.ops.wm.usd_export(**export_kwargs)
     print(f"  USD exported: {output_path}")
     print(f"  File size: {output_path.stat().st_size / 1024:.1f} KB")
 
@@ -484,7 +600,7 @@ def main():
     # 4. UV unwrap
     print("[4/6] UV unwrapping all meshes...")
     palm_name = f"{side}_palm_link"
-    uv_unwrap_all(link_objects, palm_name)
+    uv_unwrap_all(link_objects, palm_name, side)
 
     # 5. Create and assign materials
     print("[5/6] Creating PBR materials...")

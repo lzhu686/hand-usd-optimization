@@ -31,7 +31,7 @@ from PIL import Image
 from scipy.spatial import cKDTree
 
 try:
-    from pxr import Usd, UsdGeom, UsdShade, Sdf, Gf, Vt
+    from pxr import Usd, UsdGeom, UsdShade, UsdPhysics, Sdf, Gf, Vt
 except ImportError:
     print("ERROR: pxr (usd-core) not available.")
     sys.exit(1)
@@ -46,8 +46,8 @@ def get_paths(side: str) -> dict:
     base_dir = Path(__file__).resolve().parent.parent  # hand-usd-optimization/
 
     return {
-        "raw_usd_dir": base_dir / "usd_raw",
-        "uv_source": base_dir / "usd" / side / f"wuji_hand_{side}_debug.usdc",
+        "raw_usd_dir": base_dir / "usd_raw" / side,
+        "uv_source": base_dir / "usd" / side / f"wuji_hand_{side}.usdc",
         "texture_src": base_dir / "textures" / "logo" / "wuji_logo_placeholder.png",
         "blender_texture_dir": base_dir / "usd" / side / "textures",
         "fused_dir": base_dir / "fused" / side,
@@ -177,11 +177,11 @@ def get_palm_uv_data(our_usd_path: Path, side: str, link_name: str = None):
 def bake_composite_texture(
     src_texture: Path,
     target_texture_dir: Path,
-    bg_color: tuple = (160, 160, 160),
+    bg_color: tuple = (0, 0, 0),
 ) -> str:
-    """Bake composite texture: original centered on 3x grey canvas.
+    """Bake composite texture: original centered on 3x black canvas.
 
-    OmniPBR doesn't support UV Clip mode, so out-of-range UVs hit grey
+    OmniPBR doesn't support UV Clip mode, so out-of-range UVs hit black
     instead of repeating the logo. Returns the composite filename.
     """
     src = Image.open(src_texture)
@@ -200,12 +200,6 @@ def remap_uvs_for_composite(uvs: np.ndarray) -> np.ndarray:
     """Remap UV [0,1] -> [1/3, 2/3] for composite texture coordinates."""
     remapped = uvs / 3.0 + 1.0 / 3.0
     return np.clip(remapped, 0.0, 1.0)
-
-
-# ---------------------------------------------------------------------------
-# Texture extraction from Blender USD
-# ---------------------------------------------------------------------------
-
 
 
 # ---------------------------------------------------------------------------
@@ -234,9 +228,11 @@ def _add_omnipbr_shader(stage, mat, mat_path: str, color, roughness: float,
     if texture_path:
         shader.CreateInput("diffuse_texture", Sdf.ValueTypeNames.Asset).Set(
             Sdf.AssetPath(texture_path))
-        # Clamp texture instead of repeat to avoid sampling bleed at UV island edges
         shader.CreateInput("texture_translate", Sdf.ValueTypeNames.Float2).Set(Gf.Vec2f(0, 0))
         shader.CreateInput("texture_scale", Sdf.ValueTypeNames.Float2).Set(Gf.Vec2f(1, 1))
+        # Clamp texture: UV outside [0,1] returns edge pixel instead of repeating
+        shader.CreateInput("texture_wrap_u", Sdf.ValueTypeNames.Int).Set(1)  # 1 = clamp
+        shader.CreateInput("texture_wrap_v", Sdf.ValueTypeNames.Int).Set(1)  # 1 = clamp
 
     mat.CreateSurfaceOutput("mdl").ConnectToSource(shader.ConnectableAPI(), "out")
 
@@ -303,18 +299,18 @@ def create_dual_material(stage, mat_path: str, color, roughness=0.7, metallic=0.
 
 def inject_uv_to_palm(target_mesh_prim, source_mesh_prim, uv_data, uv_indices,
                        use_composite: bool = False):
-    """Replace target mesh geometry with source mesh, preserving UV.
+    """Replace target visual mesh geometry with source mesh, preserving UV.
 
-    Instead of transferring UV between different meshes (error-prone due to
-    different triangulations), we replace the entire visual mesh geometry
-    with the source mesh. This guarantees mesh + UV consistency.
+    Replaces the entire visual mesh with the Blender source mesh so that
+    mesh + UV are guaranteed consistent. Physics/collision uses separate
+    /colliders/ meshes and is unaffected.
 
     Args:
         target_mesh_prim: Target mesh prim in IsaacLab USD (will be overwritten)
-        source_mesh_prim: Source mesh prim from KeyShot USDZ (with UV)
+        source_mesh_prim: Source mesh prim from Blender (with UV)
         uv_data: UV coordinate data from source
         uv_indices: UV index data (or None)
-        use_composite: Whether to remap UVs (not needed for KeyShot textures)
+        use_composite: Whether to remap UVs for composite texture
     """
     target_mesh = UsdGeom.Mesh(target_mesh_prim)
     source_mesh = UsdGeom.Mesh(source_mesh_prim)
@@ -324,7 +320,7 @@ def inject_uv_to_palm(target_mesh_prim, source_mesh_prim, uv_data, uv_indices,
     src_fvi = np.array(source_mesh.GetFaceVertexIndicesAttr().Get())
     src_fvc = np.array(source_mesh.GetFaceVertexCountsAttr().Get())
 
-    # Coordinate alignment: auto-detect Y-axis negation (KeyShot Y-up vs IsaacLab Z-up)
+    # Coordinate alignment: auto-detect Y-axis negation
     target_points = np.array(target_mesh.GetPointsAttr().Get())
     t_sample = target_points[::3]
     d_id = cKDTree(src_points[::3]).query(t_sample)[0].mean()
@@ -350,22 +346,22 @@ def inject_uv_to_palm(target_mesh_prim, source_mesh_prim, uv_data, uv_indices,
     # Write UV primvar
     uv_values = np.array(uv_data, dtype=np.float32)
     if uv_indices is not None:
-        uv_idx = np.array(uv_indices)
-        uv_values_expanded = uv_values[uv_idx]
-    else:
-        uv_values_expanded = uv_values
-
+        uv_values = uv_values[np.array(uv_indices)]
 
     if use_composite:
-        uv_values_expanded = remap_uvs_for_composite(uv_values_expanded).astype(np.float32)
+        uv_values = remap_uvs_for_composite(uv_values).astype(np.float32)
+
+    # Clamp UVs to [0, 1] — OmniPBR doesn't reliably support wrap clamp,
+    # so we enforce it here to prevent texture repeat.
+    uv_values = np.clip(uv_values, 0.0, 1.0)
 
     primvar_api = UsdGeom.PrimvarsAPI(target_mesh_prim)
     uv_pv = primvar_api.CreatePrimvar(
         "st", Sdf.ValueTypeNames.TexCoord2fArray, "faceVarying")
-    uv_pv.Set(Vt.Vec2fArray.FromNumpy(uv_values_expanded.astype(np.float32)))
+    uv_pv.Set(Vt.Vec2fArray.FromNumpy(uv_values.astype(np.float32)))
 
     print(f"    Mesh replaced: {len(target_points)} -> {len(src_points)} verts, "
-          f"{len(src_fvc)} faces, {len(uv_values_expanded)} UVs")
+          f"{len(src_fvc)} faces, {len(uv_values)} UVs")
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +517,8 @@ def modify_base_layer(fused_dir: Path, side: str, blender_usd_path: Path,
     print(f"    Created material: BlackGlove (OmniPBR + PreviewSurface)")
 
     # Step 2: Create textured materials.
-    # Texture priority: USDZ embedded > Blender textures dir > project textures/logo/
+    # Uses original texture directly — non-logo face UVs are at (0.03, 0.02)
+    # which samples the black corner of the logo image.
     textured_mat_paths = {}
     for link_name in textured_links:
         tex_rel_path = None
@@ -530,16 +527,14 @@ def modify_base_layer(fused_dir: Path, side: str, blender_usd_path: Path,
         # Try 1: Blender textures directory (next to .usdc)
         if blender_texture_dir and blender_texture_dir.exists():
             for tex_file in blender_texture_dir.glob("*.png"):
-                import shutil as _shutil
-                _shutil.copy2(tex_file, target_texture_dir / tex_file.name)
+                shutil.copy2(tex_file, target_texture_dir / tex_file.name)
                 tex_rel_path = f"../textures/{tex_file.name}"
                 print(f"    Texture from Blender: {tex_file.name}")
                 break
 
-        # Try 3: Project fallback
+        # Try 2: Project fallback
         if not tex_rel_path and texture_src.exists():
-            import shutil as _shutil
-            _shutil.copy2(texture_src, target_texture_dir / texture_src.name)
+            shutil.copy2(texture_src, target_texture_dir / texture_src.name)
             tex_rel_path = f"../textures/{texture_src.name}"
             print(f"    Texture fallback: {texture_src.name}")
 
@@ -581,6 +576,52 @@ def modify_base_layer(fused_dir: Path, side: str, blender_usd_path: Path,
 
     stage.GetRootLayer().Save()
     print(f"    Saved: {base_path}")
+
+
+# ---------------------------------------------------------------------------
+# Collision filter pairs (palm <-> finger link2)
+# ---------------------------------------------------------------------------
+
+def add_collision_filter_pairs(fused_dir: Path, side: str):
+    """Add FilteredPairsAPI to palm_link in the physics layer.
+
+    Filters collisions between palm and each finger's link2, which are
+    geometrically close and cause jitter without filtering.
+    """
+    physics_path = fused_dir / "configuration" / "wujihand_physics.usd"
+    if not physics_path.exists():
+        print(f"    WARNING: Physics USD not found: {physics_path}")
+        return
+
+    stage = Usd.Stage.Open(str(physics_path))
+
+    # Find palm prim
+    palm_path = None
+    for prim in stage.Traverse():
+        if prim.GetName() == f"{side}_palm_link":
+            palm_path = prim.GetPath().pathString
+            break
+
+    if palm_path is None:
+        print(f"    WARNING: {side}_palm_link not found in physics layer")
+        return
+
+    palm_prim = stage.GetPrimAtPath(palm_path)
+    filtered_api = UsdPhysics.FilteredPairsAPI.Apply(palm_prim)
+    filtered_rel = filtered_api.CreateFilteredPairsRel()
+
+    # Find finger link2 prims and add as filtered targets
+    prefix = palm_path.rsplit(f"/{side}_palm_link", 1)[0]
+    count = 0
+    for i in range(1, 6):
+        link2_path = f"{prefix}/{side}_finger{i}_link2"
+        link2_prim = stage.GetPrimAtPath(link2_path)
+        if link2_prim:
+            filtered_rel.AddTarget(link2_prim.GetPath())
+            count += 1
+
+    stage.GetRootLayer().Save()
+    print(f"    Collision filter: palm <-> {count} finger link2 prims saved to {physics_path.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -683,19 +724,23 @@ def fuse_side(side: str) -> bool:
     print(f"  UV source: {paths['uv_source']}")
 
     # Step 1: Copy IsaacLab raw USD
-    print(f"\n  [1/3] Copying IsaacLab USD structure...")
+    print(f"\n  [1/4] Copying IsaacLab USD structure...")
     fused_dir = copy_rl_structure(paths)
 
     # Step 2: Modify base layer (mesh replacement + materials)
-    print(f"\n  [2/3] Modifying base layer (mesh replace + dual materials)...")
+    print(f"\n  [2/4] Modifying base layer (mesh replace + dual materials)...")
     modify_base_layer(
         fused_dir, side,
         paths["uv_source"],
         paths["texture_src"],
         paths.get("blender_texture_dir"))
 
-    # Step 3: Verify
-    print(f"\n  [3/3] Verifying fused output...")
+    # Step 3: Add collision filter pairs to physics layer
+    print(f"\n  [3/4] Adding collision filter pairs...")
+    add_collision_filter_pairs(fused_dir, side)
+
+    # Step 4: Verify
+    print(f"\n  [4/4] Verifying fused output...")
     return verify_fused(fused_dir, side)
 
 
