@@ -15,16 +15,17 @@ import argparse
 import sys
 from pathlib import Path
 
-import isaaclab.sim as sim_utils
-from isaaclab.actuators.actuator_cfg import ImplicitActuatorCfg
-from isaaclab.assets.articulation import ArticulationCfg
+# NOTE: isaaclab.sim / actuators / assets imports are deferred into
+# get_wujihand_config() because they require SimulationApp to be
+# instantiated first (Carbonite plugin system). The __main__ block
+# below handles that via AppLauncher before any conversion runs.
 
 # ---------------------------------------------------------------------------
 # Path resolution
 # ---------------------------------------------------------------------------
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent  # hand-usd-optimization/
-URDF_DIR = PROJECT_DIR.parent / "wuji-hand-description" / "urdf"
+URDF_DIR = PROJECT_DIR / "wuji-hand-description" / "urdf"
 RAW_USD_DIR = PROJECT_DIR / "usd_raw"
 FINAL_USD_DIR = PROJECT_DIR / "fused"
 BLENDER_USD_DIR = PROJECT_DIR / "usd"  # Blender debug exports (UV source)
@@ -105,8 +106,12 @@ def convert_urdf_to_usd(hand_side: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def get_wujihand_config(hand_side: str) -> ArticulationCfg:
+def get_wujihand_config(hand_side: str) -> "ArticulationCfg":
     """Return ArticulationCfg using the final (post-processed) USD."""
+    import isaaclab.sim as sim_utils
+    from isaaclab.actuators.actuator_cfg import ImplicitActuatorCfg
+    from isaaclab.assets.articulation import ArticulationCfg
+
     params = get_hand_params(hand_side)
     usd_path = str(FINAL_USD_DIR / hand_side / f"{USD_FILE_NAME}.usd")
 
@@ -152,21 +157,10 @@ def get_wujihand_config(hand_side: str) -> ArticulationCfg:
 # ---------------------------------------------------------------------------
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Convert Wuji Hand URDF to USD")
-    parser.add_argument(
-        "--side",
-        choices=["right", "left", "both"],
-        default="both",
-        help="Which hand to convert",
-    )
-    args = parser.parse_args()
-
+def main(sides):
     if not URDF_DIR.exists():
         print(f"ERROR: URDF directory not found: {URDF_DIR}")
         sys.exit(1)
-
-    sides = ["right", "left"] if args.side == "both" else [args.side]
 
     for side in sides:
         convert_urdf_to_usd(side)
@@ -175,4 +169,26 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Parse args BEFORE AppLauncher (which also adds its own args)
+    parser = argparse.ArgumentParser(description="Convert Wuji Hand URDF to USD")
+    parser.add_argument(
+        "--side",
+        choices=["right", "left", "both"],
+        default="both",
+        help="Which hand to convert",
+    )
+    # Launch SimulationApp first so isaaclab.sim.converters is importable
+    from isaaclab.app import AppLauncher
+
+    AppLauncher.add_app_launcher_args(parser)
+    args_cli = parser.parse_args()
+    # Force headless for URDF->USD conversion (no GUI needed)
+    args_cli.headless = True
+    app_launcher = AppLauncher(args_cli)
+    simulation_app = app_launcher.app
+
+    sides = ["right", "left"] if args_cli.side == "both" else [args_cli.side]
+    try:
+        main(sides)
+    finally:
+        simulation_app.close()
