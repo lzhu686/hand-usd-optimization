@@ -1,0 +1,3 @@
+[submodule "wuji-hand-description"]
+	path = wuji-hand-description
+	url = https://github.com/wuji-technology/wuji-hand-description.git
